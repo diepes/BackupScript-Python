@@ -1,0 +1,175 @@
+#!/usr/bin/python
+# (c) P.E.Smit 2008 re-write in python.
+# 20080313 Working.  use subprocess for exec and pexpect for interactive.
+#20080312 move from subprocess to pexpect (tty issue)
+'''
+ Loads config file in $filename_config
+
+[ "ETCbackup" ]
+mailto="bakupemail-changeme@gmail.com" 
+dir="/etc"
+description="ETC"
+gpgpassphrase="MySecretPassword"
+
+["tftp"]
+description="TFTP"
+dir=/tftp
+tarflags="--no-recursion"
+
+'''
+filename_config="pesbackup.cfg"
+import os
+import sys
+import subprocess
+import pexpect
+import traceback
+from time import gmtime, strftime
+##>>> strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime())
+
+from socket import gethostname 
+from configobj import ConfigObj
+from string import replace
+import smtplib
+import os
+from email.MIMEMultipart import MIMEMultipart
+from email.MIMEBase import MIMEBase
+from email.MIMEText import MIMEText
+from email.Utils import COMMASPACE, formatdate
+from email import Encoders
+
+
+
+def main():
+  conf = ConfigObj(filename_config)
+  #print conf
+  #print conf.keys
+  for section in conf:
+    if 'description' in conf[section]:
+      description=conf[section]['description']
+    else:
+      description=section
+    directorys= conf[section]['dir']
+
+    if 'tarflags' in conf[section]:
+      tarflags=conf[section]['tarflags']
+    else:
+      tarflags=""
+      
+    print "Start backup on section:", section , " description:",description
+    timestr = strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()) #'Thu, 28 Jun 2001 14:17:15 +0000'
+    timefile = strftime("%Y%m%d", gmtime())
+    #print "timestr ", timestr,   "     timefile ", timefile
+    filename= "backup_" + gethostname() +"_"+ timefile +"_"+ section + ".tar.bz"
+    filename.replace(' ','')
+    print "Creating tar ",filename," ..."
+    createTar(filename,directorys,tarflags)
+    if 'gpgpassphrase' in conf[section]:
+       gpgEncryptFile(filename,conf[section]['gpgpassphrase'])
+       subprocess.Popen(["rm" , filename])
+       filename=filename+".gpg"
+    subject ="B: " +gethostname()+ " s:" +section+ "  to " +filename+ \
+    		" created " +timestr
+    body=subject + "\n\r" + " Directory's " + directorys
+    if 'mailto' in conf[section]:
+       emaillist=conf[section]['mailto']
+       print "Emailing ",filename," to ",emaillist
+       send_mutt(gethostname(), emaillist,subject,body,[filename])
+
+
+def send_mutt(send_from, send_to, subject, text, files=[]):
+  timeout_mutt=3600
+  '''   Remember that Pexpect does NOT interpret shell meta characters such as
+	redirect, pipe, or wild cards (>, |, or *). This is a common mistake.
+	If you want to run a command and pipe it through another command then
+	you must also start a shell. For example::
+	pes: can be done with subprocess, see example used below.
+  '''
+  ##  http://docs.python.org/lib/node535.html
+  ###output=`dmesg | grep hda`
+  ###==>
+  ###p1 = Popen(["dmesg"], stdout=PIPE)
+  ###p2 = Popen(["grep", "hda"], stdin=p1.stdout, stdout=PIPE)
+  ###output = p2.communicate()[0]
+  p1 = subprocess.Popen(["echo" , '"'+text+'"'], stdout=subprocess.PIPE)
+  p2 = subprocess.Popen(["mutt", "-s", '"'+subject+'"', "-a", files[0],send_to],\
+  	stdin=p1.stdout, stdout=subprocess.PIPE).wait()
+
+
+  #subprocess.Popen([r"gzip","-d", "x.txt.gz"]).wait()
+  print "Debug start"
+  print p2
+  print "Debug end"
+
+
+  
+def send_mail(send_from, send_to, subject, text, files=[], server="localhost"):
+  assert type(send_to)==list
+  assert type(files)==list
+  msg = MIMEMultipart()
+  msg['From'] = send_from
+  msg['To'] = COMMASPACE.join(send_to)
+  msg['Date'] = formatdate(localtime=True)
+  msg['Subject'] = subject
+  # msg.attach( MIMEText(text) )
+  for f in files:
+    part = MIMEBase('application', "octet-stream")
+    part.set_payload( open(file,"rb").read() )
+    Encoders.encode_base64(part)
+    part.add_header('Content-Disposition', 'attachment; filename="%s"' % os.path.basename(f))
+    msg.attach(part)
+  smtp = smtplib.SMTP(server)
+  smtp.sendmail(send_from, send_to, msg.as_string())
+  smtp.close()
+
+def gpgEncryptFile(f,passphrase):
+  '''echo ILoveClover | gpg --batch --yes --passphrase-fd 0 --symmetric --cipher-algo
+      AES256 ${backup}
+      input file f, output f.gpg
+  '''
+  p1 = subprocess.Popen(["echo" , passphrase], stdout=subprocess.PIPE)
+  p2 = subprocess.Popen(["gpg", "--batch", "--yes", "--passphrase-fd", "0", \
+           "--symmetric", "--cipher-algo","AES256" , f],\
+  	   stdin=p1.stdout, stdout=subprocess.PIPE).wait()
+
+
+
+
+ 
+def createTar(outputFileName,dir,tarflags):
+  '''using spexpect '''
+  timeout_tar=3600
+  # Login via SSH
+  #
+  print "Executing %s %s %s"%(tarflags, outputFileName, dir)
+  child = pexpect.spawn('tar --totals %s -czvf %s %s'%(tarflags,outputFileName, dir))
+  # Total bytes written: 2314240 (2.3MiB, 23MiB/s)
+  i = child.expect([pexpect.TIMEOUT, 'tar: Error', \
+  	'Total bytes written: ([0-9]+ \(.*\))'], timeout=timeout_tar)
+  print "Here we go, expect found something ..................."
+  if i == 0: # Timeout
+    print 'ERROR! Tar timeout.'
+    #print child.before, child.after
+    #print str(child)
+    sys.exit (1)
+  if i == 1: # tar: Error message
+    print 'ERROR! Tar spitout a ERROR.'
+    print child.before, child.after
+    print str(child)
+    sys.exit (1)
+  if i ==2: # Fine got total at end.
+    print  'Got Tar total bytes written:', child.match.group(1)
+    return 'Got Tar total bytes written:', child.match.group(1)
+ 
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception, e:
+ 	print "main - loop trapped a error"
+	print
+        print str(e)
+        traceback.print_exc()
+        os._exit(1)
+
+print "The END."
